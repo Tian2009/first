@@ -113,7 +113,7 @@ def uninstall_singbox():
     
     if confirm != 'y':
         print("取消卸载")
-        return
+        return False
     
     try:
         # 停止服务
@@ -235,29 +235,36 @@ def create_self_signed_cert(domain="www.speedtest.net", cert_dir="/etc/sing-box/
 # 管理UFW端口
 def manage_ufw_port(port, action="allow"):
     # 检查UFW状态
-    result = subprocess.run(["ufw", "status"], capture_output=True, text=True)
-    status = "inactive"
-    if "Status: active" in result.stdout:
-        status = "active"
-    
-    if action == "allow":
-        try:
-            subprocess.run(["ufw", "allow", str(port)], check=True)
-            print(f"端口 {port} 已开放")
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"开放端口失败: {e}")
+    try:
+        result = subprocess.run(["ufw", "status"], capture_output=True, text=True)
+        status = "inactive"
+        if "Status: active" in result.stdout:
+            status = "active"
+        
+        if status == "inactive" and action == "allow":
+            print("警告: UFW未启用，端口可能已经开放")
+            
+        if action == "allow":
+            try:
+                subprocess.run(["ufw", "allow", str(port)], check=True)
+                print(f"端口 {port} 已开放")
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"开放端口失败: {e}")
+                return False
+        elif action == "delete":
+            try:
+                subprocess.run(["ufw", "delete", "allow", str(port)], check=True)
+                print(f"端口 {port} 已关闭")
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"关闭端口失败: {e}")
+                return False
+        else:
+            print("无效的操作")
             return False
-    elif action == "delete":
-        try:
-            subprocess.run(["ufw", "delete", "allow", str(port)], check=True)
-            print(f"端口 {port} 已关闭")
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"关闭端口失败: {e}")
-            return False
-    else:
-        print("无效的操作")
+    except Exception as e:
+        print(f"UFW操作失败: {e}")
         return False
 
 # 在终端中显示二维码
@@ -268,16 +275,15 @@ def display_terminal_qrcode(url):
         qr.add_data(url)
         qr.make(fit=True)
         
-        # 创建ASCII艺术版二维码
-        qr_ascii = qr.print_ascii(invert=True)
-        print(qr_ascii)
+        # 直接调用print_ascii显示二维码
+        qr.print_ascii(invert=True)
     except ImportError:
         print("无法显示二维码：缺少qrcode库")
     except Exception as e:
         print(f"显示二维码失败: {e}")
 
 # 生成二维码图片
-def generate_qrcode_image(url, username, node_name="", save_dir="/home/qrcode"):
+def generate_qrcode_image(url, username, node_name="", save_dir="/tmp/qrcode"):
     try:
         import qrcode
         from PIL import Image
@@ -893,6 +899,7 @@ def modify_user():
                     if "vless_url" in user_info:
                         print(f"VLESS链接: {user_info['vless_url']}")
                         display_terminal_qrcode(user_info['vless_url'])
+                        generate_qrcode_image(user_info['vless_url'], selected_username, "VLESS")
                         
         elif mod_choice == "2":
             new_password = input("请输入新的Hysteria2密码 (留空将随机生成): ").strip()
@@ -924,31 +931,107 @@ def modify_user():
                     if "hysteria2_url" in user_info:
                         print(f"Hysteria2链接: {user_info['hysteria2_url']}")
                         display_terminal_qrcode(user_info['hysteria2_url'])
+                        generate_qrcode_image(user_info['hysteria2_url'], selected_username, "Hysteria2")
                         
         elif mod_choice == "3":
-            current_name = users_info[selected_username].get("node_name", selected_username)
-            print(f"当前节点名称: {current_name}")
             new_name = input("请输入新的节点名称: ").strip()
             if not new_name:
                 print("节点名称不能为空")
                 return
                 
-            # 更新用户信息中的节点名称并重新生成链接
-            users_info[selected_username]["node_name"] = new_name
+            # 保存节点名称到配置的自定义字段
+            node_name_file = Path("/etc/sing-box/node_names.json")
+            node_names = {}
+            if node_name_file.exists():
+                try:
+                    with open(node_name_file, 'r') as f:
+                        node_names = json.load(f)
+                except:
+                    pass
             
-            # 重新生成链接并保存
-            update_user_urls(config, users_info)
+            node_names[selected_username] = new_name
             
-            print(f"\n新的连接信息:")
-            user_info = users_info.get(selected_username)
-            if user_info:
-                if "vless_url" in user_info:
-                    print(f"VLESS链接: {user_info['vless_url']}")
-                    display_terminal_qrcode(user_info['vless_url'])
-                if "hysteria2_url" in user_info:
-                    print(f"Hysteria2链接: {user_info['hysteria2_url']}")
-                    display_terminal_qrcode(user_info['hysteria2_url'])
-                    
+            with open(node_name_file, 'w') as f:
+                json.dump(node_names, f, indent=4)
+                
+            print(f"节点名称已更新为: {new_name}")
+            
+            # 重新生成链接
+            server_ip = get_server_ip()
+            reality_pubkey = ""
+            short_id = ""
+            
+            # 获取VLESS信息
+            vless_port = None
+            vless_uuid = None
+            vless_sni = "www.speedtest.net"
+            
+            # 获取Hysteria2信息
+            hy2_port = None
+            hy2_password = None
+            hy2_sni = "www.speedtest.net"
+            hy2_insecure = True
+            
+            # 从配置中读取信息
+            for inbound in config["inbounds"]:
+                if inbound.get("type") == "vless":
+                    for user in inbound.get("users", []):
+                        if user.get("name") == selected_username:
+                            vless_uuid = user.get("uuid")
+                            vless_port = inbound.get("listen_port")
+                            if "tls" in inbound:
+                                vless_sni = inbound["tls"].get("server_name", vless_sni)
+                                if "reality" in inbound["tls"]:
+                                    reality = inbound["tls"]["reality"]
+                                    short_id = reality.get("short_id", [""])[0] if isinstance(reality.get("short_id"), list) else reality.get("short_id", "")
+                                    
+                                    # 读取公钥
+                                    keys_file = Path("/etc/sing-box/cert/keys.json")
+                                    if keys_file.exists():
+                                        with open(keys_file, 'r') as f:
+                                            keys = json.load(f)
+                                            reality_pubkey = keys.get("reality", {}).get("public_key", "")
+                            break
+                
+                elif inbound.get("type") == "hysteria2":
+                    for user in inbound.get("users", []):
+                        if user.get("name") == selected_username:
+                            hy2_password = user.get("password")
+                            hy2_port = inbound.get("listen_port")
+                            if "tls" in inbound:
+                                hy2_sni = inbound["tls"].get("server_name", hy2_sni)
+                                hy2_insecure = inbound["tls"].get("insecure", hy2_insecure)
+                            break
+            
+            # 生成新链接
+            if vless_uuid and vless_port:
+                vless_url = generate_vless_url({
+                    "uuid": vless_uuid,
+                    "server_ip": server_ip,
+                    "port": vless_port,
+                    "sni": vless_sni,
+                    "fp": "chrome",
+                    "pbk": reality_pubkey,
+                    "sid": short_id
+                }, new_name)
+                
+                print(f"\nVLESS链接: {vless_url}")
+                display_terminal_qrcode(vless_url)
+                generate_qrcode_image(vless_url, selected_username, new_name + "_VLESS")
+            
+            if hy2_password and hy2_port:
+                hy2_url = generate_hysteria2_url({
+                    "password": hy2_password,
+                    "server_ip": server_ip,
+                    "port": hy2_port,
+                    "sni": hy2_sni,
+                    "insecure": hy2_insecure
+                }, new_name)
+                
+                print(f"\nHysteria2链接: {hy2_url}")
+                display_terminal_qrcode(hy2_url)
+                generate_qrcode_image(hy2_url, selected_username, new_name + "_Hysteria2")
+                
         elif mod_choice == "0":
             return
         else:
@@ -965,55 +1048,80 @@ def update_user_urls(config, users_info):
     
     # 获取Reality公钥
     reality_pubkey = ""
-    for inbound in config["inbounds"]:
-        if inbound.get("type") == "vless" and inbound.get("tls", {}).get("reality"):
-            reality_pubkey = inbound["tls"]["reality"].get("public_key", "")
-            break
+    keys_file = Path("/etc/sing-box/cert/keys.json")
+    if keys_file.exists():
+        try:
+            with open(keys_file, 'r') as f:
+                keys = json.load(f)
+                reality_pubkey = keys.get("reality", {}).get("public_key", "")
+        except:
+            pass
+    
+    # 获取节点名称
+    node_name_file = Path("/etc/sing-box/node_names.json")
+    node_names = {}
+    if node_name_file.exists():
+        try:
+            with open(node_name_file, 'r') as f:
+                node_names = json.load(f)
+        except:
+            pass
     
     # 更新所有用户的URL
     for username, info in users_info.items():
+        # 获取节点名称
+        node_name = node_names.get(username, username)
+        
         # 更新VLESS URL
         for inbound in config["inbounds"]:
             if inbound.get("type") == "vless":
                 for user in inbound.get("users", []):
                     if user.get("name") == username:
-                        short_id = inbound["tls"]["reality"].get("short_id", [""])[0] if isinstance(inbound["tls"]["reality"].get("short_id"), list) else inbound["tls"]["reality"].get("short_id", "")
-                        node_name = info.get("node_name", username)
-                        vless_url = generate_vless_url({
-                            "uuid": user.get("uuid"),
-                            "server_ip": server_ip,
-                            "port": inbound.get("listen_port"),
-                            "sni": inbound["tls"]["reality"].get("server_name", "www.speedtest.net"),
-                            "fp": inbound["tls"]["reality"].get("fingerprint", "chrome"),
-                            "pbk": reality_pubkey,
-                            "sid": short_id,
-                            "flow": user.get("flow", "xtls-rprx-vision")
-                        }, node_name)
-                        info["vless_url"] = vless_url
-                        break
-            
-            # 更新Hysteria2 URL
-            elif inbound.get("type") == "hysteria2":
+                        if "tls" in inbound and "reality" in inbound["tls"]:
+                            short_id = inbound["tls"]["reality"].get("short_id", [""])[0] if isinstance(inbound["tls"]["reality"].get("short_id"), list) else inbound["tls"]["reality"].get("short_id", "")
+                            sni = inbound["tls"].get("server_name", "www.speedtest.net")
+                            fp = inbound["tls"]["reality"].get("fingerprint", "chrome")
+                            
+                            vless_url = generate_vless_url({
+                                "uuid": user.get("uuid"),
+                                "server_ip": server_ip,
+                                "port": inbound.get("listen_port"),
+                                "sni": sni,
+                                "fp": fp,
+                                "pbk": reality_pubkey,
+                                "sid": short_id,
+                                "flow": user.get("flow", "xtls-rprx-vision")
+                            }, node_name)
+                            info["vless_url"] = vless_url
+        
+        # 更新Hysteria2 URL
+        for inbound in config["inbounds"]:
+            if inbound.get("type") == "hysteria2":
                 for user in inbound.get("users", []):
                     if user.get("name") == username:
-                        node_name = info.get("node_name", username)
+                        sni = inbound.get("tls", {}).get("server_name", "www.speedtest.net")
+                        insecure = inbound.get("tls", {}).get("insecure", True)
+                        
                         hy2_url = generate_hysteria2_url({
                             "password": user.get("password"),
                             "server_ip": server_ip,
                             "port": inbound.get("listen_port"),
-                            "sni": inbound.get("tls", {}).get("server_name", "www.speedtest.net"),
-                            "insecure": inbound.get("tls", {}).get("insecure", True)
+                            "sni": sni,
+                            "insecure": insecure
                         }, node_name)
                         info["hysteria2_url"] = hy2_url
-                        break
 
 # 管理防火墙
 def manage_firewall():
     # 检查UFW状态
-    result = subprocess.run(["ufw", "status"], capture_output=True, text=True)
-    status = "inactive"
-    if "Status: active" in result.stdout:
-        status = "active"
+    try:
+        result = subprocess.run(["ufw", "status"], capture_output=True, text=True)
+        status = "inactive"
+        if "Status: active" in result.stdout:
+            status = "active"
+    except Exception as e:
+        print(f"获取UFW状态失败: {e}")
+        status = "unknown"
     
     while True:
         print("\n=== 防火墙管理 ===")
@@ -1076,40 +1184,91 @@ def manage_singbox():
     
     while True:
         print("\n=== sing-box 管理 ===")
-        print("1. 查看 sing-box 状态")
-        print("2. 查看 sing-box 日志")
-        print("3. 启动 sing-box 服务")
-        print("4. 实时查看日志")
-        print("5. 停止 sing-box 服务")
-        print("6. 卸载 sing-box")
+        if installed:
+            print(f"当前版本: {version}")
+            print("1. 查看 sing-box 状态")
+            print("2. 查看 sing-box 日志")
+            print("3. 启动 sing-box 服务")
+            print("4. 重启 sing-box 服务") 
+            print("5. 停止 sing-box 服务")
+            print("6. 实时查看日志")
+            print("7. 更新 sing-box")
+            print("8. 卸载 sing-box")
+        else:
+            print("sing-box 未安装")
+            print("1. 安装 sing-box (稳定版)")
+            print("2. 安装 sing-box (测试版)")
+            print("3. 安装指定版本")
         print("0. 返回上级菜单")
         
-        choice = input("\n请选择操作 [0-6]: ").strip()
+        choice = input("\n请选择操作: ").strip()
         
-        if choice == "1":
-            view_singbox_status()
-        elif choice == "2":
-            view_singbox_logs()
-        elif choice == "3":
-            start_service()
-        elif choice == "4":
-            print("\n=== 实时日志 (按Ctrl+C退出) ===")
-            try:
-                subprocess.run(["journalctl", "-u", "sing-box", "-f"], check=True)
-            except KeyboardInterrupt:
-                print("\n已退出日志查看")
-            except Exception as e:
-                print(f"查看日志失败: {e}")
-        elif choice == "5":
-            stop_service()
-        elif choice == "6":
-            if uninstall_singbox():
-                # 如果成功卸载，退出此菜单
+        if installed:
+            if choice == "1":
+                view_singbox_status()
+            elif choice == "2":
+                view_singbox_logs()
+            elif choice == "3":
+                start_service()
+            elif choice == "4":
+                restart_service()
+            elif choice == "5":
+                stop_service()
+            elif choice == "6":
+                print("\n=== 实时日志 (按Ctrl+C退出) ===")
+                try:
+                    subprocess.run(["journalctl", "-u", "sing-box", "-f"], check=True)
+                except KeyboardInterrupt:
+                    print("\n已退出日志查看")
+                except Exception as e:
+                    print(f"查看日志失败: {e}")
+            elif choice == "7":
+                print("\n=== 更新 sing-box ===")
+                print("1. 更新到最新稳定版")
+                print("2. 更新到最新测试版")
+                print("3. 更新到指定版本")
+                print("0. 返回")
+                
+                update_choice = input("\n请选择更新类型: ").strip()
+                if update_choice == "1":
+                    if install_singbox("stable"):
+                        installed, version = check_singbox()
+                elif update_choice == "2":
+                    if install_singbox("beta"):
+                        installed, version = check_singbox()
+                elif update_choice == "3":
+                    specific_version = input("请输入要安装的版本号 (例如 v1.5.0): ").strip()
+                    if specific_version:
+                        if install_singbox("specific", specific_version):
+                            installed, version = check_singbox()
+                elif update_choice == "0":
+                    continue
+                else:
+                    print("无效选择")
+            elif choice == "8":
+                if uninstall_singbox():
+                    installed = False
+                    version = None
+            elif choice == "0":
                 return
-        elif choice == "0":
-            return
+            else:
+                print("无效选择，请重试")
         else:
-            print("无效选择，请重试")
+            if choice == "1":
+                if install_singbox("stable"):
+                    installed, version = check_singbox()
+            elif choice == "2":
+                if install_singbox("beta"):
+                    installed, version = check_singbox()
+            elif choice == "3":
+                specific_version = input("请输入要安装的版本号 (例如 v1.5.0): ").strip()
+                if specific_version:
+                    if install_singbox("specific", specific_version):
+                        installed, version = check_singbox()
+            elif choice == "0":
+                return
+            else:
+                print("无效选择，请重试")
         
         input("\n按Enter键继续...")
 
@@ -1175,7 +1334,14 @@ def main():
         while True:
             os.system('clear' if os.name == 'posix' else 'cls')
             print("\n=== sing-box 安装配置工具 ===")
-            print("1. 安装或更新 sing-box")
+            
+            installed, version = check_singbox()
+            if installed:
+                print(f"当前sing-box版本: {version}")
+            else:
+                print("sing-box未安装")
+                
+            print("1. sing-box 管理")
             print("2. 配置 sing-box")
             print("3. 用户管理")
             print("4. 防火墙管理")
@@ -1205,3 +1371,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
